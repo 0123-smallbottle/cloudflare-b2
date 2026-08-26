@@ -230,17 +230,12 @@ export function createDownloadGateResponse(path, sitekey) {
     <h1>Preparing your download</h1>
     <p class="file">${escapeHtml(filename)}</p>
     <p id="status">Checking your browser…</p>
-    <form id="download-form" method="post">
-      <input id="turnstile-token" type="hidden" name="cf-turnstile-response">
-    </form>
     <div id="turnstile-container"></div>
     <noscript><p class="error">JavaScript is required to verify this download.</p></noscript>
   </main>
   <script nonce="${nonce}">
     (() => {
-      const form = document.getElementById('download-form')
       const status = document.getElementById('status')
-      const tokenInput = document.getElementById('turnstile-token')
       let submitted = false
 
       const fail = (message) => {
@@ -252,12 +247,27 @@ export function createDownloadGateResponse(path, sitekey) {
         window.turnstile.render('#turnstile-container', {
           sitekey: ${sitekeyJson},
           action: '${TURNSTILE_ACTION}',
-          callback: (token) => {
+          callback: async (token) => {
             if (submitted) return
             submitted = true
-            tokenInput.value = token
-            status.textContent = 'Verification complete. Redirecting…'
-            form.requestSubmit()
+            status.textContent = 'Verification complete. Opening your download…'
+
+            try {
+              const response = await fetch(window.location.href, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ 'cf-turnstile-response': token }),
+                credentials: 'same-origin',
+              })
+              if (!response.ok) throw new Error('verification request failed')
+
+              const result = await response.json()
+              const downloadUrl = new URL(result.location)
+              if (downloadUrl.protocol !== 'https:') throw new Error('invalid download URL')
+              window.location.replace(downloadUrl.href)
+            } catch {
+              fail('Could not open the download. Reload the page to try again.')
+            }
           },
           'error-callback': () => fail('Browser verification failed. Reload the page to try again.'),
           'expired-callback': () => fail('Browser verification expired. Reload the page to try again.'),
@@ -272,7 +282,7 @@ export function createDownloadGateResponse(path, sitekey) {
   return new Response(html, {
     headers: {
       'Cache-Control': 'no-store',
-      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}' https://challenges.cloudflare.com; style-src 'nonce-${nonce}'; connect-src https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'self'`,
+      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}' https://challenges.cloudflare.com; style-src 'nonce-${nonce}'; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'`,
       'Content-Type': 'text/html; charset=utf-8',
       'Referrer-Policy': 'no-referrer',
       'X-Content-Type-Options': 'nosniff',
@@ -577,16 +587,16 @@ export default {
         aws: { signQuery: true },
       })
 
-      return new Response(null, {
-        headers: {
-          'Cache-Control': 'no-store',
-          Location: presignedRequest.url,
-          'Referrer-Policy': 'no-referrer',
-          'X-Content-Type-Options': 'nosniff',
+      return Response.json(
+        { location: presignedRequest.url },
+        {
+          headers: {
+            'Cache-Control': 'no-store',
+            'Referrer-Policy': 'no-referrer',
+            'X-Content-Type-Options': 'nosniff',
+          },
         },
-        status: 303,
-        statusText: 'See Other',
-      })
+      )
     }
 
     // Certain headers, such as x-real-ip, appear in the incoming request but

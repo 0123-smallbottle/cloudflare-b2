@@ -69,7 +69,7 @@ test('percent-encodes the decoded object path for Backblaze', () => {
   )
 })
 
-test('submits immediately when Invisible Turnstile verification completes', async () => {
+test('opens the direct URL immediately when Invisible Turnstile verification completes', async () => {
   const response = createDownloadGateResponse(
     '/b2/video file.mp4',
     'test-site-key',
@@ -81,8 +81,13 @@ test('submits immediately when Invisible Turnstile verification completes', asyn
   assert.doesNotMatch(html, /setInterval/)
   assert.match(html, /api\.js\?render=explicit&onload=onTurnstileLoad/)
   assert.match(html, /action: 'download'/)
-  assert.match(html, /Verification complete\. Redirecting/)
-  assert.match(html, /name="cf-turnstile-response"/)
+  assert.match(html, /Verification complete\. Opening your download/)
+  assert.match(html, /fetch\(window\.location\.href/)
+  assert.match(html, /window\.location\.replace\(downloadUrl\.href\)/)
+  assert.match(
+    response.headers.get('content-security-policy'),
+    /connect-src 'self'/,
+  )
   assert.doesNotMatch(html, /TURNSTILE_SECRET/)
 })
 
@@ -216,9 +221,9 @@ test('gates a signed download, redirects to a range-friendly presigned URL, and 
       })
 
     const download = await worker.fetch(createPost(), env)
-    assert.equal(download.status, 303)
+    assert.equal(download.status, 200)
     assert.equal(download.headers.get('cache-control'), 'no-store')
-    const location = new URL(download.headers.get('location'))
+    const location = new URL((await download.json()).location)
     assert.equal(
       location.origin,
       'https://test-bucket.s3.us-west-004.backblazeb2.com',

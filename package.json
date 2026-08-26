@@ -2,10 +2,11 @@
   "private": true,
   "name": "cloudflare-b2",
   "version": "1.2.0",
+  "type": "module",
   "description": "Provide access to a private Backblaze B2 bucket via a Cloudflare Worker",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test",
     "format": "prettier --write '**/*.{js,css,json,md}'"
   },
   "author": "Pat Patterson <pat@backblaze.com>",
