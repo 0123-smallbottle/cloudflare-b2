@@ -1,2 +1,5 @@
 # Configuration for running the app in local dev mode
 B2_APPLICATION_KEY = "<your b2 application key>"
+ALIST_SIGNING_TOKEN = "<your AList global token>"
+TURNSTILE_SECRET = "<your Turnstile secret key>"
+TURNSTILE_HOSTNAMES = "localhost,127.0.0.1"
