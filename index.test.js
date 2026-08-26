@@ -6,6 +6,7 @@ import worker, {
   createDownloadGateResponse,
   decodeAndNormalizePath,
   encodeObjectPath,
+  getPresignedUrlLifetime,
   getObjectPath,
   readTurnstileToken,
   verifyTurnstileToken,
@@ -45,6 +46,15 @@ test('rejects expired, permanent, and path-tampered signatures', async () => {
   )
 })
 
+test('limits a presigned URL to the remaining AList lifetime', () => {
+  assert.equal(getPresignedUrlLifetime('digest=:1600', 1000), 600)
+  assert.equal(
+    getPresignedUrlLifetime('digest=:9999999', 1000),
+    7 * 24 * 60 * 60,
+  )
+  assert.equal(getPresignedUrlLifetime('digest=:999', 1000), null)
+})
+
 test('matches AList path decoding and removes only the configured mount', () => {
   const path = decodeAndNormalizePath('/b2/video%20file.mp4')
   assert.equal(path, '/b2/video file.mp4')
@@ -59,7 +69,7 @@ test('percent-encodes the decoded object path for Backblaze', () => {
   )
 })
 
-test('renders an invisible Turnstile gate with a three-second countdown', async () => {
+test('submits immediately when Invisible Turnstile verification completes', async () => {
   const response = createDownloadGateResponse(
     '/b2/video file.mp4',
     'test-site-key',
@@ -67,9 +77,11 @@ test('renders an invisible Turnstile gate with a three-second countdown', async 
   const html = await response.text()
 
   assert.equal(response.headers.get('cache-control'), 'no-store')
-  assert.match(html, />3<\/div>/)
+  assert.doesNotMatch(html, /countdown/i)
+  assert.doesNotMatch(html, /setInterval/)
   assert.match(html, /api\.js\?render=explicit&onload=onTurnstileLoad/)
   assert.match(html, /action: 'download'/)
+  assert.match(html, /Verification complete\. Redirecting/)
   assert.match(html, /name="cf-turnstile-response"/)
   assert.doesNotMatch(html, /TURNSTILE_SECRET/)
 })
@@ -150,7 +162,7 @@ test('fails closed when Siteverify returns the wrong action or a replay', async 
   )
 })
 
-test('gates a signed download, streams it after verification, and rejects replay', async () => {
+test('gates a signed download, redirects to a range-friendly presigned URL, and rejects replay', async () => {
   const path = '/b2/file.zip'
   const expiration = Math.floor(Date.now() / 1000) + 60
   const signedUrl = `https://b2.127631.xyz${path}?sign=${encodeURIComponent(sign(path, expiration))}`
@@ -174,7 +186,6 @@ test('gates a signed download, streams it after verification, and rejects replay
 
   const originalFetch = globalThis.fetch
   let siteverifyCalls = 0
-  let b2Calls = 0
   globalThis.fetch = async (input) => {
     const url = typeof input === 'string' ? input : input.url
     if (url.includes('/turnstile/v0/siteverify')) {
@@ -191,12 +202,6 @@ test('gates a signed download, streams it after verification, and rejects replay
         hostname: 'b2.127631.xyz',
       })
     }
-    if (url.startsWith('https://test-bucket.s3.us-west-004.backblazeb2.com/')) {
-      b2Calls += 1
-      return new Response('file-content', {
-        headers: { 'Content-Type': 'application/zip' },
-      })
-    }
     throw new Error(`Unexpected fetch URL: ${url}`)
   }
 
@@ -211,13 +216,25 @@ test('gates a signed download, streams it after verification, and rejects replay
       })
 
     const download = await worker.fetch(createPost(), env)
-    assert.equal(download.status, 200)
-    assert.equal(await download.text(), 'file-content')
+    assert.equal(download.status, 303)
+    assert.equal(download.headers.get('cache-control'), 'no-store')
+    const location = new URL(download.headers.get('location'))
+    assert.equal(
+      location.origin,
+      'https://test-bucket.s3.us-west-004.backblazeb2.com',
+    )
+    assert.equal(location.pathname, '/file.zip')
+    assert.equal(location.searchParams.has('sign'), false)
+    assert.equal(
+      location.searchParams.get('X-Amz-Algorithm'),
+      'AWS4-HMAC-SHA256',
+    )
+    assert.equal(location.searchParams.get('X-Amz-SignedHeaders'), 'host')
+    assert.ok(Number(location.searchParams.get('X-Amz-Expires')) <= 60)
 
     const replay = await worker.fetch(createPost(), env)
     assert.equal(replay.status, 403)
     assert.equal(siteverifyCalls, 2)
-    assert.equal(b2Calls, 1)
   } finally {
     globalThis.fetch = originalFetch
   }

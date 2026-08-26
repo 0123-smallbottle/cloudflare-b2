@@ -31,10 +31,10 @@ const RANGE_RETRY_ATTEMPTS = 3
 
 const TURNSTILE_ACTION = 'download'
 const TURNSTILE_BODY_MAX_BYTES = 4096
-const TURNSTILE_COUNTDOWN_SECONDS = 3
 const TURNSTILE_SITEVERIFY_URL =
   'https://challenges.cloudflare.com/turnstile/v0/siteverify'
 const TURNSTILE_TOKEN_MAX_LENGTH = 2048
+const PRESIGNED_URL_MAX_SECONDS = 7 * 24 * 60 * 60
 
 const textEncoder = new TextEncoder()
 
@@ -121,6 +121,28 @@ export async function verifyAlistSignature(
   )
 }
 
+export function getPresignedUrlLifetime(
+  signature,
+  now = Math.floor(Date.now() / 1000),
+) {
+  if (typeof signature !== 'string') {
+    return null
+  }
+
+  const separator = signature.lastIndexOf(':')
+  const expirationText = signature.slice(separator + 1)
+  if (separator <= 0 || !/^[1-9]\d*$/.test(expirationText)) {
+    return null
+  }
+
+  const expiration = Number(expirationText)
+  if (!Number.isSafeInteger(expiration) || expiration <= now) {
+    return null
+  }
+
+  return Math.min(expiration - now, PRESIGNED_URL_MAX_SECONDS)
+}
+
 export function getObjectPath(alistPath, mountPath) {
   const normalizedMountPath = normalizePath(mountPath)
   if (normalizedMountPath === '/') {
@@ -200,7 +222,6 @@ export function createDownloadGateResponse(path, sitekey) {
     body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #0b1020; color: #f8fafc; }
     main { width: min(30rem, calc(100% - 2rem)); padding: 2rem; text-align: center; background: #151c32; border: 1px solid #2b3658; border-radius: 1rem; box-shadow: 0 1rem 3rem #0006; }
     .file { overflow-wrap: anywhere; color: #b8c5e8; }
-    .count { display: inline-grid; place-items: center; width: 4rem; height: 4rem; margin: 1rem; border: 2px solid #60a5fa; border-radius: 50%; font-size: 1.75rem; font-variant-numeric: tabular-nums; }
     .error { color: #fca5a5; }
   </style>
 </head>
@@ -208,8 +229,7 @@ export function createDownloadGateResponse(path, sitekey) {
   <main>
     <h1>Preparing your download</h1>
     <p class="file">${escapeHtml(filename)}</p>
-    <div id="count" class="count" aria-live="polite">${TURNSTILE_COUNTDOWN_SECONDS}</div>
-    <p id="status">Checking your browser while the countdown runs…</p>
+    <p id="status">Checking your browser…</p>
     <form id="download-form" method="post">
       <input id="turnstile-token" type="hidden" name="cf-turnstile-response">
     </form>
@@ -219,46 +239,25 @@ export function createDownloadGateResponse(path, sitekey) {
   <script nonce="${nonce}">
     (() => {
       const form = document.getElementById('download-form')
-      const count = document.getElementById('count')
       const status = document.getElementById('status')
       const tokenInput = document.getElementById('turnstile-token')
-      let seconds = ${TURNSTILE_COUNTDOWN_SECONDS}
-      let countdownFinished = false
-      let tokenReady = false
       let submitted = false
-
-      const submitWhenReady = () => {
-        if (!submitted && countdownFinished && tokenReady) {
-          submitted = true
-          status.textContent = 'Starting download…'
-          form.requestSubmit()
-        }
-      }
 
       const fail = (message) => {
         status.textContent = message
         status.className = 'error'
       }
 
-      const timer = window.setInterval(() => {
-        seconds -= 1
-        count.textContent = String(Math.max(seconds, 0))
-        if (seconds <= 0) {
-          window.clearInterval(timer)
-          countdownFinished = true
-          if (!tokenReady) status.textContent = 'Finishing browser verification…'
-          submitWhenReady()
-        }
-      }, 1000)
-
       window.onTurnstileLoad = () => {
         window.turnstile.render('#turnstile-container', {
           sitekey: ${sitekeyJson},
           action: '${TURNSTILE_ACTION}',
           callback: (token) => {
+            if (submitted) return
+            submitted = true
             tokenInput.value = token
-            tokenReady = true
-            submitWhenReady()
+            status.textContent = 'Verification complete. Redirecting…'
+            form.requestSubmit()
           },
           'error-callback': () => fail('Browser verification failed. Reload the page to try again.'),
           'expired-callback': () => fail('Browser verification expired. Reload the page to try again.'),
@@ -426,11 +425,12 @@ export default {
     }
 
     const alistPath = decodeAndNormalizePath(url.pathname)
+    const alistSignature = url.searchParams.get('sign')
     const signatureValid =
       alistPath !== null &&
       (await verifyAlistSignature(
         alistPath,
-        url.searchParams.get('sign'),
+        alistSignature,
         env['ALIST_SIGNING_TOKEN'],
       ))
     if (!signatureValid) {
@@ -540,15 +540,6 @@ export default {
         break
     }
 
-    // Certain headers, such as x-real-ip, appear in the incoming request but
-    // are removed from the outgoing request. If they are in the outgoing
-    // signed headers, B2 can't validate the signature.
-    const headers = filterHeaders(request.headers, env)
-    if (request.method === 'POST') {
-      headers.delete('content-length')
-      headers.delete('content-type')
-    }
-
     // Create an S3 API client that can sign the outgoing request
     const client = new AwsClient({
       accessKeyId: env['B2_APPLICATION_KEY_ID'],
@@ -568,6 +559,40 @@ export default {
         url.pathname = path.replace(/^file\/[^/]+\//, '')
       }
     }
+
+    if (request.method === 'POST') {
+      const expires = getPresignedUrlLifetime(alistSignature)
+      if (expires === null) {
+        return new Response(null, {
+          status: 401,
+          statusText: 'Unauthorized',
+        })
+      }
+
+      // The browser and external download managers follow this URL directly.
+      // Only the host header is signed, so independent Range requests work.
+      url.searchParams.set('X-Amz-Expires', String(expires))
+      const presignedRequest = await client.sign(url.toString(), {
+        method: 'GET',
+        aws: { signQuery: true },
+      })
+
+      return new Response(null, {
+        headers: {
+          'Cache-Control': 'no-store',
+          Location: presignedRequest.url,
+          'Referrer-Policy': 'no-referrer',
+          'X-Content-Type-Options': 'nosniff',
+        },
+        status: 303,
+        statusText: 'See Other',
+      })
+    }
+
+    // Certain headers, such as x-real-ip, appear in the incoming request but
+    // are removed from the outgoing request. If they are in the outgoing
+    // signed headers, B2 can't validate the signature.
+    const headers = filterHeaders(request.headers, env)
 
     // Sign the outgoing request
     //

@@ -103,10 +103,11 @@ links and requires updating the Worker secret.
 
 ## Verify Browser Downloads with Turnstile
 
-Browser `GET` requests now receive a three-second download page while an Invisible Turnstile challenge runs in the
-background. When both complete, the page submits the single-use Turnstile token to the same signed URL. The Worker
-validates the token with Siteverify before streaming the existing B2 response; it does not expose the Turnstile secret
-or redirect to an unprotected object URL.
+Browser `GET` requests receive a download page while an Invisible Turnstile challenge runs in the background. As soon
+as verification completes, the page submits the single-use Turnstile token to the same signed URL. The Worker validates
+the token with Siteverify, then responds with a `303 See Other` redirect to a temporary B2 S3 presigned URL. Download
+managers can follow that URL and issue independent HTTP Range requests for multithreaded downloads. The presigned URL
+never lasts longer than the original AList link and is capped at seven days.
 
 The public site key and production hostname allowlist are configured in `wrangler.toml`. Keep
 `TURNSTILE_HOSTNAMES` deployment-specific: production must not include `localhost` or `127.0.0.1`. The widget itself
