@@ -34,7 +34,9 @@ const TURNSTILE_BODY_MAX_BYTES = 4096
 const TURNSTILE_SITEVERIFY_URL =
   'https://challenges.cloudflare.com/turnstile/v0/siteverify'
 const TURNSTILE_TOKEN_MAX_LENGTH = 2048
-const PRESIGNED_URL_MAX_SECONDS = 7 * 24 * 60 * 60
+const VERIFIED_DOWNLOAD_MAX_SECONDS = 7 * 24 * 60 * 60
+const VERIFIED_DOWNLOAD_PARAM = 'download'
+const VERIFIED_DOWNLOAD_TOKEN_CONTEXT = 'cloudflare-b2-download-v1'
 
 const textEncoder = new TextEncoder()
 
@@ -66,12 +68,34 @@ export function decodeAndNormalizePath(pathname) {
 
 function decodeBase64Url(value) {
   try {
-    const base64 = value.replaceAll('-', '+').replaceAll('_', '/')
+    const unpadded = value.replaceAll('-', '+').replaceAll('_', '/')
+    const base64 = unpadded.padEnd(Math.ceil(unpadded.length / 4) * 4, '=')
     const decoded = atob(base64)
     return Uint8Array.from(decoded, (char) => char.charCodeAt(0))
   } catch {
     return null
   }
+}
+
+function encodeBase64Url(value) {
+  return btoa(String.fromCharCode(...value))
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/, '')
+}
+
+async function importHmacKey(secret, usages) {
+  if (typeof secret !== 'string' || secret.length === 0) {
+    return null
+  }
+
+  return crypto.subtle.importKey(
+    'raw',
+    textEncoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    usages,
+  )
 }
 
 export async function verifyAlistSignature(
@@ -105,13 +129,10 @@ export async function verifyAlistSignature(
     return false
   }
 
-  const key = await crypto.subtle.importKey(
-    'raw',
-    textEncoder.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['verify'],
-  )
+  const key = await importHmacKey(secret, ['verify'])
+  if (!key) {
+    return false
+  }
 
   return crypto.subtle.verify(
     'HMAC',
@@ -121,7 +142,7 @@ export async function verifyAlistSignature(
   )
 }
 
-export function getPresignedUrlLifetime(
+export function getVerifiedDownloadLifetime(
   signature,
   now = Math.floor(Date.now() / 1000),
 ) {
@@ -140,7 +161,77 @@ export function getPresignedUrlLifetime(
     return null
   }
 
-  return Math.min(expiration - now, PRESIGNED_URL_MAX_SECONDS)
+  return Math.min(expiration - now, VERIFIED_DOWNLOAD_MAX_SECONDS)
+}
+
+function getVerifiedDownloadMessage(path, expirationText) {
+  return `${VERIFIED_DOWNLOAD_TOKEN_CONTEXT}\n${expirationText}\n${path}`
+}
+
+export async function createVerifiedDownloadToken(path, expiration, secret) {
+  if (
+    typeof path !== 'string' ||
+    !Number.isSafeInteger(expiration) ||
+    expiration <= 0
+  ) {
+    return null
+  }
+
+  const key = await importHmacKey(secret, ['sign'])
+  if (!key) {
+    return null
+  }
+
+  const expirationText = String(expiration)
+  const digest = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    textEncoder.encode(getVerifiedDownloadMessage(path, expirationText)),
+  )
+  return `${encodeBase64Url(new Uint8Array(digest))}:${expirationText}`
+}
+
+export async function verifyDownloadToken(
+  path,
+  token,
+  secret,
+  now = Math.floor(Date.now() / 1000),
+) {
+  if (typeof path !== 'string' || typeof token !== 'string') {
+    return false
+  }
+
+  const separator = token.lastIndexOf(':')
+  if (separator <= 0) {
+    return false
+  }
+
+  const digest = decodeBase64Url(token.slice(0, separator))
+  const expirationText = token.slice(separator + 1)
+  if (!digest || !/^[1-9]\d*$/.test(expirationText)) {
+    return false
+  }
+
+  const expiration = Number(expirationText)
+  if (
+    !Number.isSafeInteger(expiration) ||
+    expiration <= now ||
+    expiration - now > VERIFIED_DOWNLOAD_MAX_SECONDS
+  ) {
+    return false
+  }
+
+  const key = await importHmacKey(secret, ['verify'])
+  if (!key) {
+    return false
+  }
+
+  return crypto.subtle.verify(
+    'HMAC',
+    key,
+    digest,
+    textEncoder.encode(getVerifiedDownloadMessage(path, expirationText)),
+  )
 }
 
 export function getObjectPath(alistPath, mountPath) {
@@ -435,15 +526,28 @@ export default {
     }
 
     const alistPath = decodeAndNormalizePath(url.pathname)
+    const now = Math.floor(Date.now() / 1000)
     const alistSignature = url.searchParams.get('sign')
-    const signatureValid =
-      alistPath !== null &&
-      (await verifyAlistSignature(
-        alistPath,
-        alistSignature,
-        env['ALIST_SIGNING_TOKEN'],
-      ))
-    if (!signatureValid) {
+    const verifiedDownloadToken = url.searchParams.get(VERIFIED_DOWNLOAD_PARAM)
+    const [signatureValid, downloadTokenValid] = await Promise.all([
+      alistPath !== null
+        ? verifyAlistSignature(
+            alistPath,
+            alistSignature,
+            env['ALIST_SIGNING_TOKEN'],
+            now,
+          )
+        : false,
+      alistPath !== null
+        ? verifyDownloadToken(
+            alistPath,
+            verifiedDownloadToken,
+            env['ALIST_SIGNING_TOKEN'],
+            now,
+          )
+        : false,
+    ])
+    if (!signatureValid && !downloadTokenValid) {
       return new Response(null, {
         status: 401,
         statusText: 'Unauthorized',
@@ -482,11 +586,18 @@ export default {
       })
     }
 
-    if (request.method === 'GET') {
+    if (request.method === 'GET' && !downloadTokenValid) {
       return createDownloadGateResponse(alistPath, env['TURNSTILE_SITE_KEY'])
     }
 
     if (request.method === 'POST') {
+      if (!signatureValid) {
+        return new Response(null, {
+          status: 401,
+          statusText: 'Unauthorized',
+        })
+      }
+
       const token = await readTurnstileToken(request)
       if (!token || !(await verifyTurnstileToken(request, env, token))) {
         return new Response(
@@ -501,12 +612,47 @@ export default {
           },
         )
       }
+
+      const lifetime = getVerifiedDownloadLifetime(alistSignature, now)
+      if (lifetime === null) {
+        return new Response(null, {
+          status: 401,
+          statusText: 'Unauthorized',
+        })
+      }
+
+      const downloadToken = await createVerifiedDownloadToken(
+        alistPath,
+        now + lifetime,
+        env['ALIST_SIGNING_TOKEN'],
+      )
+      if (!downloadToken) {
+        return new Response(null, {
+          status: 500,
+          statusText: 'Internal Server Error',
+        })
+      }
+
+      const verifiedUrl = new URL(request.url)
+      verifiedUrl.search = ''
+      verifiedUrl.searchParams.set(VERIFIED_DOWNLOAD_PARAM, downloadToken)
+      return Response.json(
+        { location: verifiedUrl.toString() },
+        {
+          headers: {
+            'Cache-Control': 'no-store',
+            'Referrer-Policy': 'no-referrer',
+            'X-Content-Type-Options': 'nosniff',
+          },
+        },
+      )
     }
 
     // AList signs its virtual mount path. B2 receives only the path within that mount.
     url.pathname = encodeObjectPath(objectPath)
     url.searchParams.delete('sign')
     url.searchParams.delete('alist_ts')
+    url.searchParams.delete(VERIFIED_DOWNLOAD_PARAM)
 
     // Incoming protocol and port is taken from the worker's environment.
     // Local dev mode uses plain http on 8787, and it's possible to deploy
@@ -568,35 +714,6 @@ export default {
         // Remove leading file/{bucket_name}/ prefix from the path
         url.pathname = path.replace(/^file\/[^/]+\//, '')
       }
-    }
-
-    if (request.method === 'POST') {
-      const expires = getPresignedUrlLifetime(alistSignature)
-      if (expires === null) {
-        return new Response(null, {
-          status: 401,
-          statusText: 'Unauthorized',
-        })
-      }
-
-      // The browser and external download managers follow this URL directly.
-      // Only the host header is signed, so independent Range requests work.
-      url.searchParams.set('X-Amz-Expires', String(expires))
-      const presignedRequest = await client.sign(url.toString(), {
-        method: 'GET',
-        aws: { signQuery: true },
-      })
-
-      return Response.json(
-        { location: presignedRequest.url },
-        {
-          headers: {
-            'Cache-Control': 'no-store',
-            'Referrer-Policy': 'no-referrer',
-            'X-Content-Type-Options': 'nosniff',
-          },
-        },
-      )
     }
 
     // Certain headers, such as x-real-ip, appear in the incoming request but

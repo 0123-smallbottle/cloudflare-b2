@@ -3,12 +3,14 @@ import { createHmac } from 'node:crypto'
 import test from 'node:test'
 
 import worker, {
+  createVerifiedDownloadToken,
   createDownloadGateResponse,
   decodeAndNormalizePath,
   encodeObjectPath,
-  getPresignedUrlLifetime,
+  getVerifiedDownloadLifetime,
   getObjectPath,
   readTurnstileToken,
+  verifyDownloadToken,
   verifyTurnstileToken,
   verifyAlistSignature,
 } from './index.js'
@@ -46,13 +48,30 @@ test('rejects expired, permanent, and path-tampered signatures', async () => {
   )
 })
 
-test('limits a presigned URL to the remaining AList lifetime', () => {
-  assert.equal(getPresignedUrlLifetime('digest=:1600', 1000), 600)
+test('limits a verified download URL to the remaining AList lifetime', () => {
+  assert.equal(getVerifiedDownloadLifetime('digest=:1600', 1000), 600)
   assert.equal(
-    getPresignedUrlLifetime('digest=:9999999', 1000),
+    getVerifiedDownloadLifetime('digest=:9999999', 1000),
     7 * 24 * 60 * 60,
   )
-  assert.equal(getPresignedUrlLifetime('digest=:999', 1000), null)
+  assert.equal(getVerifiedDownloadLifetime('digest=:999', 1000), null)
+})
+
+test('creates a path-bound, expiring verified download token', async () => {
+  const token = await createVerifiedDownloadToken('/b2/file.zip', 1600, TOKEN)
+
+  assert.equal(
+    await verifyDownloadToken('/b2/file.zip', token, TOKEN, 1000),
+    true,
+  )
+  assert.equal(
+    await verifyDownloadToken('/b2/other.zip', token, TOKEN, 1000),
+    false,
+  )
+  assert.equal(
+    await verifyDownloadToken('/b2/file.zip', token, TOKEN, 1600),
+    false,
+  )
 })
 
 test('matches AList path decoding and removes only the configured mount', () => {
@@ -167,7 +186,7 @@ test('fails closed when Siteverify returns the wrong action or a replay', async 
   )
 })
 
-test('gates a signed download, redirects to a range-friendly presigned URL, and rejects replay', async () => {
+test('gates a signed download, keeps ranged traffic on Cloudflare, and rejects replay', async () => {
   const path = '/b2/file.zip'
   const expiration = Math.floor(Date.now() / 1000) + 60
   const signedUrl = `https://b2.127631.xyz${path}?sign=${encodeURIComponent(sign(path, expiration))}`
@@ -191,7 +210,8 @@ test('gates a signed download, redirects to a range-friendly presigned URL, and 
 
   const originalFetch = globalThis.fetch
   let siteverifyCalls = 0
-  globalThis.fetch = async (input) => {
+  let b2Calls = 0
+  globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input.url
     if (url.includes('/turnstile/v0/siteverify')) {
       siteverifyCalls += 1
@@ -205,6 +225,20 @@ test('gates a signed download, redirects to a range-friendly presigned URL, and 
         success: true,
         action: 'download',
         hostname: 'b2.127631.xyz',
+      })
+    }
+    if (url.startsWith('https://test-bucket.s3.us-west-004.backblazeb2.com/')) {
+      b2Calls += 1
+      const headers =
+        typeof input === 'string' ? new Headers(init?.headers) : input.headers
+      assert.equal(headers.get('range'), 'bytes=0-3')
+      assert.equal(new URL(url).searchParams.has('download'), false)
+      return new Response('file', {
+        status: 206,
+        headers: {
+          'Accept-Ranges': 'bytes',
+          'Content-Range': 'bytes 0-3/4',
+        },
       })
     }
     throw new Error(`Unexpected fetch URL: ${url}`)
@@ -224,18 +258,19 @@ test('gates a signed download, redirects to a range-friendly presigned URL, and 
     assert.equal(download.status, 200)
     assert.equal(download.headers.get('cache-control'), 'no-store')
     const location = new URL((await download.json()).location)
-    assert.equal(
-      location.origin,
-      'https://test-bucket.s3.us-west-004.backblazeb2.com',
-    )
-    assert.equal(location.pathname, '/file.zip')
+    assert.equal(location.origin, 'https://b2.127631.xyz')
+    assert.equal(location.pathname, '/b2/file.zip')
     assert.equal(location.searchParams.has('sign'), false)
-    assert.equal(
-      location.searchParams.get('X-Amz-Algorithm'),
-      'AWS4-HMAC-SHA256',
+    assert.equal(location.searchParams.has('X-Amz-Signature'), false)
+    assert.ok(location.searchParams.get('download'))
+
+    const rangedDownload = await worker.fetch(
+      new Request(location, { headers: { Range: 'bytes=0-3' } }),
+      env,
     )
-    assert.equal(location.searchParams.get('X-Amz-SignedHeaders'), 'host')
-    assert.ok(Number(location.searchParams.get('X-Amz-Expires')) <= 60)
+    assert.equal(rangedDownload.status, 206)
+    assert.equal(await rangedDownload.text(), 'file')
+    assert.equal(b2Calls, 1)
 
     const replay = await worker.fetch(createPost(), env)
     assert.equal(replay.status, 403)

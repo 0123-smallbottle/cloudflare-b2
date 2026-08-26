@@ -105,9 +105,10 @@ links and requires updating the Worker secret.
 
 Browser `GET` requests receive a download page while an Invisible Turnstile challenge runs in the background. As soon
 as verification completes, the page sends the single-use Turnstile token to the same signed URL. The Worker validates
-the token with Siteverify and returns a temporary B2 S3 presigned URL, which the page opens as a top-level navigation.
-Download managers can use that direct URL and issue independent HTTP Range requests for multithreaded downloads. The
-presigned URL never lasts longer than the original AList link and is capped at seven days.
+the token with Siteverify and returns a temporary, path-bound URL on the Worker's own hostname, which the page opens as
+a top-level navigation. Download managers can use that URL and issue independent HTTP Range requests for multithreaded
+downloads. Every file request remains proxied through Cloudflare; Backblaze credentials and direct B2 URLs stay
+server-side. The verified URL never lasts longer than the original AList link and is capped at seven days.
 
 The public site key and production hostname allowlist are configured in `wrangler.toml`. Keep
 `TURNSTILE_HOSTNAMES` deployment-specific: production must not include `localhost` or `127.0.0.1`. The widget itself
