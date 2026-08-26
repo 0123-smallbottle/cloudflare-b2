@@ -1,0 +1,8 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-b2",
+  "main": "index.js",
+  "compatibility_date": "2023-09-04",
+  "workers_dev": false,
+  "keep_vars": true
+}
